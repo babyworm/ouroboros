@@ -10,6 +10,8 @@ Used by: session-start.py (auto-check on session start)
 
 import json
 from pathlib import Path
+import sys
+import tempfile
 import time
 
 _CACHE_DIR = Path.home() / ".ouroboros"
@@ -55,11 +57,16 @@ def get_latest_version() -> str | None:
         import ssl
         import urllib.request
 
-        # Create SSL context with fallback for systems with missing certs
         try:
             ctx = ssl.create_default_context()
         except Exception:
-            ctx = ssl._create_unverified_context()  # noqa: S323
+            # SSL cert bundle unavailable — skip version check rather than
+            # bypassing certificate verification (MITM risk).
+            print(
+                "ouroboros: SSL certificate bundle unavailable, skipping update check",
+                file=sys.stderr,
+            )
+            return None
 
         resp = urllib.request.urlopen(  # noqa: S310
             "https://pypi.org/pypi/ouroboros-ai/json", timeout=5, context=ctx
@@ -67,12 +74,20 @@ def get_latest_version() -> str | None:
         data = json.loads(resp.read())
         latest = data["info"]["version"]
 
-        # Cache the result
+        # Cache the result (atomic write to avoid race conditions)
         try:
             _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            _CACHE_FILE.write_text(json.dumps({"latest_version": latest, "timestamp": time.time()}))
+            cache_content = json.dumps({"latest_version": latest, "timestamp": time.time()})
+            fd, tmp_path = tempfile.mkstemp(dir=_CACHE_DIR, suffix=".tmp")
+            try:
+                with open(fd, "w") as f:
+                    f.write(cache_content)
+                Path(tmp_path).replace(_CACHE_FILE)
+            except Exception:
+                Path(tmp_path).unlink(missing_ok=True)
+                raise
         except Exception:
-            pass
+            print("ouroboros: failed to write version cache", file=sys.stderr)
 
         return latest
     except Exception:
@@ -104,7 +119,6 @@ def check_update() -> dict:
             "message": None,
         }
 
-    # Simple version comparison (works for semver)
     from packaging.version import Version
 
     try:
@@ -119,17 +133,9 @@ def check_update() -> dict:
                 ),
             }
     except Exception:
-        # Fallback: string comparison
-        if latest != current:
-            return {
-                "update_available": True,
-                "current": current,
-                "latest": latest,
-                "message": (
-                    f"Ouroboros update available: v{current} → v{latest}. "
-                    f"Run `ooo update` to upgrade."
-                ),
-            }
+        # Version parsing failed — cannot determine ordering safely.
+        # Return False rather than risking a false positive (e.g. downgrade).
+        pass
 
     return {
         "update_available": False,

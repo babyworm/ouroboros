@@ -29,8 +29,9 @@ When the user invokes this skill:
 2. **Check latest version on PyPI**:
    ```bash
    python3 -c "
-   import json, urllib.request
-   data = json.loads(urllib.request.urlopen('https://pypi.org/pypi/ouroboros-ai/json', timeout=5).read())
+   import json, ssl, urllib.request
+   ctx = ssl.create_default_context()
+   data = json.loads(urllib.request.urlopen('https://pypi.org/pypi/ouroboros-ai/json', timeout=5, context=ctx).read())
    print(data['info']['version'])
    "
    ```
@@ -66,7 +67,7 @@ When the user invokes this skill:
 
    b. **Update Claude Code plugin**:
    ```bash
-   claude plugin install ouroboros@ouroboros
+   claude plugin update ouroboros@ouroboros
    ```
 
    c. **Verify**:

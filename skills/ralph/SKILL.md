@@ -18,7 +18,7 @@ ooo ralph "<your request>"
 
 ## How It Works
 
-Ralph mode includes parallel execution + automatic verification + persistence:
+Ralph mode includes parallel execution + automatic verification:
 
 1. **Execute** (parallel where possible)
    - Independent tasks run concurrently
@@ -34,40 +34,16 @@ Ralph mode includes parallel execution + automatic verification + persistence:
    - Fix issues
    - Repeat from step 1
 
-4. **Persist** (checkpoint)
-   - Save state after each iteration
-   - Resume capability if interrupted
-   - Full audit trail
-
 ## Instructions
 
 When the user invokes this skill:
 
 1. **Parse the request**: Extract what needs to be done
 
-2. **Detect git workflow** (before any commits):
-   - Read the project's `CLAUDE.md` (project root and `.claude/CLAUDE.md`)
-   - Look for PR-based workflow indicators:
-     - "PR-based workflow", "never commit directly to main", "always create a branch", "create pull request"
-   - If PR-based workflow detected:
-     - Check current branch — if on `main`/`master`, create a feature branch: `ooo/ralph/<lineage_id>`
-     - Use `git checkout -b ooo/ralph/<lineage_id>` before starting work
-     - All commits go to this branch
-   - If no preference found: use current branch (backward compatible)
-
-3. **Initialize state**: Create `.omc/state/ralph-state.json`:
-   ```json
-   {
-     "mode": "ralph",
-     "session_id": "<uuid>",
-     "request": "<user request>",
-     "status": "running",
-     "iteration": 0,
-     "max_iterations": 10,
-     "last_checkpoint": null,
-     "verification_history": []
-   }
-   ```
+2. **Initialize loop**:
+   - Generate a session_id (UUID)
+   - Track iteration, verification_history in conversation context
+   - No file I/O needed — evolve_step stores all execution data in EventStore
 
 4. **Enter the loop**:
 
@@ -83,39 +59,29 @@ When the user invokes this skill:
        verification.passed = (qa_verdict == "pass")
        verification.score = qa_score
 
-       # Record in history
-       state.verification_history.append({
+       # Record in conversation context
+       verification_history.append({
            "iteration": iteration,
            "passed": verification.passed,
            "score": verification.score,
-           "verdict": qa_verdict,
-           "timestamp": <now>
+           "verdict": qa_verdict
        })
 
        if verification.passed:
-           # SUCCESS - persist final checkpoint
-           await save_checkpoint("complete")
-
-           # If PR-based workflow: push branch and suggest/create PR
-           if git_workflow.use_branches:
-               git push -u origin <branch_name>
-               suggest: "Create PR with `gh pr create`"
-               # If auto_pr: create PR automatically
-
+           # SUCCESS
            break
 
        # Failed - analyze and continue
        iteration += 1
-       await save_checkpoint("iteration_{iteration}")
 
        if iteration >= max_iterations:
            # Max iterations reached
            break
    ```
 
-5. **On termination**, display a 📍 next-step:
-   - **Success** (QA passed): `📍 Next: ooo evaluate for formal 3-stage verification`
-   - **Max iterations reached**: `📍 Next: ooo interview to re-examine the problem — or ooo unstuck to try a different approach`
+4. **On termination**, display a next-step:
+   - **Success** (QA passed): `Next: ooo evaluate for formal 3-stage verification`
+   - **Max iterations reached**: `Next: ooo interview to re-examine the problem — or ooo unstuck to try a different approach`
 
 6. **Report progress** each iteration:
    ```
@@ -133,21 +99,10 @@ When the user invokes this skill:
    The boulder never stops. Continuing...
    ```
 
-7. **Handle interruption**:
-   - If user says "stop": save checkpoint, exit gracefully
-   - If user says "continue": reload from last checkpoint
-   - State persists across session resets
-
-## Persistence
-
-State includes:
-- Current iteration number
-- Verification history for all iterations
-- Last successful checkpoint
-- Issues found in each iteration
-- Execution context for resume
-
-Resume command: "continue ralph" or "ralph continue"
+6. **Handle interruption**:
+   - If user says "stop": exit gracefully
+   - If user says "continue": call `ouroboros_query_events(aggregate_id=<lineage_id>)`
+     to reconstruct iteration history from EventStore
 
 ## The Boulder Never Stops
 
@@ -198,7 +153,6 @@ QA Verdict: PASS (score: 1.0)
 Ralph COMPLETE
 ==============
 Request: Fix all failing tests
-Duration: 8m 32s
 Iterations: 3
 
 QA History:
@@ -208,11 +162,5 @@ QA History:
 
 All tests passing. Build successful.
 
-📍 Next: `ooo evaluate` for formal 3-stage verification
+Next: `ooo evaluate` for formal 3-stage verification
 ```
-
-## Cancellation
-
-Cancel with `/ouroboros:cancel --force` to clear state.
-
-Standard `/ouroboros:cancel` saves checkpoint for resume.

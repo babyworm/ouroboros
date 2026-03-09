@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from importlib.machinery import SourceFileLoader
+import importlib.util
 import json
 from pathlib import Path
 import time
@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 
 # Load the script as a module
 _SCRIPT_PATH = Path(__file__).parent.parent.parent.parent / "scripts" / "version-check.py"
-version_check = SourceFileLoader("version_check", str(_SCRIPT_PATH)).load_module()
+_spec = importlib.util.spec_from_file_location("version_check", str(_SCRIPT_PATH))
+version_check = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(version_check)
 
 
 class TestGetInstalledVersion:
@@ -127,6 +129,16 @@ class TestCheckUpdate:
 
         assert result["update_available"] is False
 
+    def test_version_parse_failure_returns_false(self) -> None:
+        """Version parsing failure does not falsely report update."""
+        with (
+            patch.object(version_check, "get_installed_version", return_value="invalid"),
+            patch.object(version_check, "get_latest_version", return_value="also-invalid"),
+        ):
+            result = version_check.check_update()
+
+        assert result["update_available"] is False
+
 
 class TestKeywordDetector:
     """Test that ooo update keyword is registered."""
@@ -136,7 +148,9 @@ class TestKeywordDetector:
         detector_path = (
             Path(__file__).parent.parent.parent.parent / "scripts" / "keyword-detector.py"
         )
-        detector = SourceFileLoader("keyword_detector", str(detector_path)).load_module()
+        spec = importlib.util.spec_from_file_location("keyword_detector", str(detector_path))
+        detector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(detector)
 
         result = detector.detect_keywords("ooo update")
         assert result["detected"] is True
@@ -147,7 +161,9 @@ class TestKeywordDetector:
         detector_path = (
             Path(__file__).parent.parent.parent.parent / "scripts" / "keyword-detector.py"
         )
-        detector = SourceFileLoader("keyword_detector", str(detector_path)).load_module()
+        spec = importlib.util.spec_from_file_location("keyword_detector", str(detector_path))
+        detector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(detector)
 
         result = detector.detect_keywords("ooo upgrade")
         assert result["detected"] is True
