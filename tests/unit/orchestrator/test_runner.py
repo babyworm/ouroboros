@@ -16,7 +16,7 @@ from ouroboros.core.seed import (
     Seed,
     SeedMetadata,
 )
-from ouroboros.orchestrator.adapter import AgentMessage
+from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
 from ouroboros.orchestrator.runner import (
     OrchestratorError,
     OrchestratorResult,
@@ -324,6 +324,62 @@ class TestOrchestratorRunner:
             result = await runner.resume_session("nonexistent", sample_seed)
 
         assert result.is_err
+
+    def test_deserialize_runtime_handle_supports_legacy_progress(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Test legacy Claude session progress still reconstructs a runtime handle."""
+        handle = runner._deserialize_runtime_handle({"agent_session_id": "sess_legacy"})
+
+        assert handle == RuntimeHandle(backend="claude", native_session_id="sess_legacy")
+
+    @pytest.mark.asyncio
+    async def test_resume_session_uses_runtime_handle(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Test resume_session passes normalized runtime handles to the adapter."""
+        from ouroboros.core.types import Result
+
+        runtime_handle = RuntimeHandle(
+            backend="claude",
+            native_session_id="sess_runtime",
+        )
+        running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.RUNNING
+        )
+        running_tracker = running_tracker.with_progress({"runtime": runtime_handle.to_dict()})
+
+        captured_kwargs: dict[str, Any] = {}
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            captured_kwargs.update(kwargs)
+            yield AgentMessage(
+                type="result",
+                content="Resumed successfully",
+                data={"subtype": "success", "session_id": "sess_runtime"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_reconstruct(*args: Any, **kwargs: Any):
+            return Result.ok(running_tracker)
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "reconstruct_session", mock_reconstruct),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        assert captured_kwargs["resume_handle"] == runtime_handle
 
 
 class TestOrchestratorError:

@@ -47,7 +47,7 @@ from ouroboros.orchestrator.level_context import (
 
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
-    from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+    from ouroboros.orchestrator.adapter import AgentRuntime
     from ouroboros.orchestrator.dependency_analyzer import DependencyGraph
     from ouroboros.persistence.event_store import EventStore
 
@@ -136,7 +136,7 @@ class ParallelACExecutor:
 
     def __init__(
         self,
-        adapter: ClaudeAgentAdapter,
+        adapter: AgentRuntime,
         event_store: EventStore,
         console: Console | None = None,
         enable_decomposition: bool = True,
@@ -145,7 +145,7 @@ class ParallelACExecutor:
         """Initialize executor.
 
         Args:
-            adapter: Claude Agent adapter for execution.
+            adapter: Agent runtime for execution.
             event_store: Event store for progress tracking.
             console: Rich console for output.
             enable_decomposition: Enable Claude to decompose complex ACs.
@@ -917,7 +917,13 @@ When complete, explicitly state: [TASK_COMPLETE]
             ):
                 messages.append(message)
 
-                if ac_session_id is None and message.data.get("session_id"):
+                if (
+                    ac_session_id is None
+                    and message.resume_handle is not None
+                    and message.resume_handle.native_session_id
+                ):
+                    ac_session_id = message.resume_handle.native_session_id
+                elif ac_session_id is None and message.data.get("session_id"):
                     ac_session_id = message.data["session_id"]
 
                 if message.tool_name:

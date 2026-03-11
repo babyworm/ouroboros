@@ -1935,6 +1935,15 @@ class EvolveStepHandler:
                     required=False,
                     default=False,
                 ),
+                MCPToolParameter(
+                    name="project_dir",
+                    type=ToolInputType.STRING,
+                    description=(
+                        "Project root directory for validation (pytest collection check). "
+                        "If omitted, auto-detected from execution output or CWD."
+                    ),
+                    required=False,
+                ),
             ),
         )
 
@@ -1977,6 +1986,12 @@ class EvolveStepHandler:
 
         execute = arguments.get("execute", True)
         parallel = arguments.get("parallel", True)
+        project_dir = arguments.get("project_dir")
+        normalized_project_dir = (
+            project_dir if isinstance(project_dir, str) and project_dir else None
+        )
+
+        project_dir_token = self.evolutionary_loop.set_project_dir(normalized_project_dir)
 
         try:
             # Ensure event store is initialized before evolve_step accesses it
@@ -1993,6 +2008,8 @@ class EvolveStepHandler:
                     tool_name="ouroboros_evolve_step",
                 )
             )
+        finally:
+            self.evolutionary_loop.reset_project_dir(project_dir_token)
 
         if result.is_err:
             return Result.err(

@@ -80,6 +80,70 @@ def _build_tool_signature(parameters: tuple[MCPToolParameter, ...]) -> inspect.S
     return inspect.Signature(parameters=sig_params)
 
 
+def _looks_like_project_root(path: object) -> bool:
+    """Return True when the given path looks like a project root."""
+    from pathlib import Path
+
+    if not isinstance(path, Path):
+        return False
+
+    return (
+        (path / "pyproject.toml").exists()
+        or (path / "setup.py").exists()
+        or (path / "package.json").exists()
+    )
+
+
+def _project_dir_from_seed(seed: Any) -> str | None:
+    """Extract a likely project directory from seed metadata or brownfield context."""
+    if seed is None:
+        return None
+
+    seed_meta = getattr(seed, "metadata", None)
+    if seed_meta:
+        project_dir = getattr(seed_meta, "project_dir", None) or getattr(
+            seed_meta,
+            "working_directory",
+            None,
+        )
+        if project_dir:
+            return str(project_dir)
+
+    brownfield_context = getattr(seed, "brownfield_context", None)
+    context_references = getattr(brownfield_context, "context_references", ()) or ()
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        role = getattr(reference, "role", None)
+        if isinstance(path, str) and path and role == "primary":
+            return path
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        if isinstance(path, str) and path:
+            return path
+
+    return None
+
+
+def _project_dir_from_artifact(artifact: str) -> str | None:
+    """Extract a likely project root from Write/Edit tool output."""
+    from pathlib import Path
+    import re
+
+    write_matches = re.findall(r"(?:Write|Edit): (/[^\s]+)", artifact)
+    for path_str in write_matches:
+        candidate = Path(path_str).parent
+        for _ in range(10):
+            if _looks_like_project_root(candidate):
+                return str(candidate)
+            if candidate == candidate.parent:
+                break
+            candidate = candidate.parent
+
+    return None
+
+
 class MCPServerAdapter:
     """Concrete implementation of MCPServer protocol.
 
@@ -577,12 +641,13 @@ def create_ouroboros_server(
         debug=False,
         enable_decomposition=True,
     )
+    # Stage 1 (mechanical checks: lint/build/test) can be enabled via env var.
+    # Disabled by default to reduce latency per generation step.
+    evolve_stage1 = os.environ.get("OUROBOROS_EVOLVE_STAGE1", "false").lower() == "true"
     evolution_eval_pipeline = EvaluationPipeline(
         llm_adapter=llm_adapter,
-        # Stage 1 is intentionally disabled here to avoid running full
-        # mechanical checks on every generation step.
         config=PipelineConfig(
-            stage1_enabled=False,
+            stage1_enabled=evolve_stage1,
             stage2_enabled=True,
             stage3_enabled=False,
         ),
@@ -665,26 +730,25 @@ def create_ouroboros_server(
 
     spec_extractor = AssertionExtractor(llm_adapter=llm_adapter)
 
-    def _extract_project_dir(artifact: str) -> str | None:
-        """Extract project directory from execution output.
-
-        Looks for Write/Edit file paths and walks up to find project root.
-        """
+    def _extract_project_dir(artifact: str, seed: Any = None) -> str | None:
+        """Resolve project directory from explicit config, seed context, or artifacts."""
         from pathlib import Path
-        import re
 
-        write_matches = re.findall(r"(?:Write|Edit): (/[^\s]+)", artifact)
-        if not write_matches:
-            return None
+        configured_project_dir = evolutionary_loop.get_project_dir()
+        if configured_project_dir:
+            return configured_project_dir
 
-        for path_str in write_matches:
-            candidate = Path(path_str).parent
-            for _ in range(10):
-                if (candidate / "pyproject.toml").exists() or (candidate / "setup.py").exists():
-                    return str(candidate)
-                if candidate == candidate.parent:
-                    break
-                candidate = candidate.parent
+        seed_project_dir = _project_dir_from_seed(seed)
+        if seed_project_dir:
+            return seed_project_dir
+
+        artifact_project_dir = _project_dir_from_artifact(artifact)
+        if artifact_project_dir:
+            return artifact_project_dir
+
+        cwd = Path.cwd()
+        if _looks_like_project_root(cwd):
+            return str(cwd)
 
         return None
 
@@ -698,7 +762,7 @@ def create_ouroboros_server(
         Returns a corrected EvaluationSummary if discrepancies are detected,
         or None if no override is needed (verification passed or unavailable).
         """
-        project_dir = _extract_project_dir(artifact)
+        project_dir = _extract_project_dir(artifact, seed=seed)
         if not project_dir:
             return None
 
@@ -817,7 +881,7 @@ def create_ouroboros_server(
             current_ac = "Verify execution output meets requirements"
 
         # Collect file-based artifacts for richer evaluation
-        project_dir = _extract_project_dir(artifact)
+        project_dir = _extract_project_dir(artifact, seed=seed)
         artifact_bundle = ArtifactCollector().collect(artifact, project_dir)
 
         eval_context = EvaluationContext(
@@ -851,7 +915,7 @@ def create_ouroboros_server(
             failure_reason=result.failure_reason,
         )
 
-    async def _evolution_validator(_seed: Any, execution_output: str | None) -> str:
+    async def _evolution_validator(seed: Any, execution_output: str | None) -> str:
         """Validate and reconcile code generated by parallel AC execution.
 
         After parallel ACs generate code independently, inconsistencies
@@ -865,21 +929,15 @@ def create_ouroboros_server(
         import re
         import subprocess  # noqa: S404  # nosec
 
-        # Extract project directory from execution output
-        # The parallel executor writes to the project directory referenced in the seed
-        project_dir = None
-        write_matches = re.findall(r"Write: (/[^\s]+)", execution_output or "")
-        if write_matches:
-            paths = [Path(p) for p in write_matches]
-            # Walk up from the first written file to find a dir with pyproject.toml or setup.py
-            candidate = paths[0].parent
-            for _ in range(10):
-                if (candidate / "pyproject.toml").exists() or (candidate / "setup.py").exists():
-                    project_dir = str(candidate)
-                    break
-                candidate = candidate.parent
+        project_dir = _extract_project_dir(execution_output or "", seed=seed)
 
         if not project_dir:
+            log.warning(
+                "evolution.validation.skipped",
+                reason="could not determine project directory",
+                has_seed_metadata=_project_dir_from_seed(seed) is not None,
+                execution_output_length=len(execution_output) if execution_output else 0,
+            )
             return "Validation skipped: could not determine project directory"
 
         # Detect the correct Python binary (prefer project venv over system)

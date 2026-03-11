@@ -337,6 +337,56 @@ class TestSessionRepository:
         assert tracker.messages_processed == 1
 
     @pytest.mark.asyncio
+    async def test_reconstruct_session_merges_progress_updates(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test reconstruction merges progress payloads across events."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        runtime_progress = MagicMock()
+        runtime_progress.type = "orchestrator.progress.updated"
+        runtime_progress.data = {
+            "progress": {
+                "runtime": {
+                    "backend": "claude",
+                    "native_session_id": "sess_native",
+                },
+                "messages_processed": 3,
+            }
+        }
+
+        message_progress = MagicMock()
+        message_progress.type = "orchestrator.progress.updated"
+        message_progress.data = {
+            "progress": {
+                "last_message_type": "assistant",
+                "messages_processed": 7,
+            }
+        }
+
+        mock_event_store.replay.return_value = [
+            start_event,
+            runtime_progress,
+            message_progress,
+        ]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.messages_processed == 7
+        assert tracker.progress["last_message_type"] == "assistant"
+        assert tracker.progress["runtime"]["native_session_id"] == "sess_native"
+
+    @pytest.mark.asyncio
     async def test_reconstruct_completed_session(
         self,
         repository: SessionRepository,

@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
@@ -72,9 +73,85 @@ def _format_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
     return f"{tool_name}: {detail}" if detail else tool_name
 
 
+def _optional_str(value: object) -> str | None:
+    """Return a string value when present, otherwise None."""
+    return value if isinstance(value, str) and value else None
+
+
 # =============================================================================
 # Data Models
 # =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeHandle:
+    """Backend-neutral resume handle for agent runtimes.
+
+    Attributes:
+        backend: Runtime backend identifier (for example, "claude" or "codex_cli").
+        kind: Handle kind for future extensibility.
+        native_session_id: Backend-native session identifier when available.
+        conversation_id: Durable conversation/thread identifier when applicable.
+        previous_response_id: Last response identifier for turn-chaining APIs.
+        transcript_path: Optional transcript path for CLI-based runtimes.
+        cwd: Working directory used for execution.
+        approval_mode: Runtime approval/sandbox mode if available.
+        updated_at: ISO timestamp when the handle was last updated.
+        metadata: Backend-specific extension data.
+    """
+
+    backend: str
+    kind: str = "agent_runtime"
+    native_session_id: str | None = None
+    conversation_id: str | None = None
+    previous_response_id: str | None = None
+    transcript_path: str | None = None
+    cwd: str | None = None
+    approval_mode: str | None = None
+    updated_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the handle for progress persistence."""
+        return {
+            "backend": self.backend,
+            "kind": self.kind,
+            "native_session_id": self.native_session_id,
+            "conversation_id": self.conversation_id,
+            "previous_response_id": self.previous_response_id,
+            "transcript_path": self.transcript_path,
+            "cwd": self.cwd,
+            "approval_mode": self.approval_mode,
+            "updated_at": self.updated_at,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> RuntimeHandle | None:
+        """Deserialize a runtime handle from persisted progress data."""
+        if not isinstance(value, dict):
+            return None
+
+        backend = value.get("backend")
+        if not isinstance(backend, str) or not backend:
+            return None
+
+        metadata = value.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        return cls(
+            backend=backend,
+            kind=str(value.get("kind", "agent_runtime")),
+            native_session_id=_optional_str(value.get("native_session_id")),
+            conversation_id=_optional_str(value.get("conversation_id")),
+            previous_response_id=_optional_str(value.get("previous_response_id")),
+            transcript_path=_optional_str(value.get("transcript_path")),
+            cwd=_optional_str(value.get("cwd")),
+            approval_mode=_optional_str(value.get("approval_mode")),
+            updated_at=_optional_str(value.get("updated_at")),
+            metadata=metadata,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,12 +163,14 @@ class AgentMessage:
         content: Human-readable content.
         tool_name: Name of tool being called (if type="tool").
         data: Additional message data.
+        resume_handle: Backend-neutral runtime resume handle, if available.
     """
 
     type: str
     content: str
     tool_name: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
+    resume_handle: RuntimeHandle | None = None
 
     @property
     def is_final(self) -> bool:
@@ -113,12 +192,38 @@ class TaskResult:
         final_message: The final result message content.
         messages: All messages from the execution.
         session_id: Claude Agent session ID for resumption.
+        resume_handle: Backend-neutral resume handle for resumption.
     """
 
     success: bool
     final_message: str
     messages: tuple[AgentMessage, ...]
     session_id: str | None = None
+    resume_handle: RuntimeHandle | None = None
+
+
+class AgentRuntime(Protocol):
+    """Protocol for autonomous agent runtimes used by the orchestrator."""
+
+    async def execute_task(
+        self,
+        prompt: str,
+        tools: list[str] | None = None,
+        system_prompt: str | None = None,
+        resume_handle: RuntimeHandle | None = None,
+        resume_session_id: str | None = None,
+    ) -> AsyncIterator[AgentMessage]:
+        """Execute a task and stream normalized messages."""
+
+    async def execute_task_to_result(
+        self,
+        prompt: str,
+        tools: list[str] | None = None,
+        system_prompt: str | None = None,
+        resume_handle: RuntimeHandle | None = None,
+        resume_session_id: str | None = None,
+    ) -> Result[TaskResult, ProviderError]:
+        """Execute a task and return the collected final result."""
 
 
 # =============================================================================
@@ -211,11 +316,25 @@ class ClaudeAgentAdapter:
         error_str = str(error).lower()
         return any(pattern in error_str for pattern in TRANSIENT_ERROR_PATTERNS)
 
+    def _build_runtime_handle(self, native_session_id: str | None) -> RuntimeHandle | None:
+        """Build a normalized runtime handle for the current Claude session."""
+        if not native_session_id:
+            return None
+
+        return RuntimeHandle(
+            backend="claude",
+            native_session_id=native_session_id,
+            cwd=os.getcwd(),
+            approval_mode=self._permission_mode,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+
     async def execute_task(
         self,
         prompt: str,
         tools: list[str] | None = None,
         system_prompt: str | None = None,
+        resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
     ) -> AsyncIterator[AgentMessage]:
         """Execute a task and yield progress messages.
@@ -227,7 +346,8 @@ class ClaudeAgentAdapter:
             prompt: The task for Claude to perform.
             tools: List of tools Claude can use. Defaults to DEFAULT_TOOLS.
             system_prompt: Optional custom system prompt.
-            resume_session_id: Session ID to resume from.
+            resume_handle: Backend-neutral handle to resume from.
+            resume_session_id: Legacy Claude session ID to resume from.
 
         Yields:
             AgentMessage for each SDK message (assistant reasoning, tool calls, results).
@@ -257,13 +377,19 @@ class ClaudeAgentAdapter:
             prompt_preview=prompt[:100],
             tools=effective_tools,
             has_system_prompt=bool(system_prompt),
+            resume_backend=resume_handle.backend if resume_handle else None,
             resume_session_id=resume_session_id,
         )
 
         # Retry loop for transient errors
         attempt = 0
         last_error: Exception | None = None
-        current_session_id = resume_session_id
+        current_runtime_handle = resume_handle
+        current_session_id = (
+            resume_handle.native_session_id
+            if resume_handle and resume_handle.native_session_id
+            else resume_session_id
+        )
 
         while attempt < MAX_RETRIES:
             attempt += 1
@@ -292,17 +418,21 @@ class ClaudeAgentAdapter:
                     agent_message = self._convert_message(sdk_message)
 
                     # Capture session ID from init message
-                    if hasattr(sdk_message, "session_id"):
-                        session_id = sdk_message.session_id
+                    session_id = getattr(sdk_message, "session_id", None) or agent_message.data.get(
+                        "session_id"
+                    )
+                    if session_id:
                         current_session_id = session_id  # Save for potential retry
+                        current_runtime_handle = self._build_runtime_handle(session_id)
 
-                    # Update data with session_id if available
-                    if session_id and agent_message.is_final:
-                        agent_message = AgentMessage(
-                            type=agent_message.type,
-                            content=agent_message.content,
-                            tool_name=agent_message.tool_name,
-                            data={**agent_message.data, "session_id": session_id},
+                    if current_runtime_handle:
+                        data = agent_message.data
+                        if current_session_id and data.get("session_id") != current_session_id:
+                            data = {**data, "session_id": current_session_id}
+                        agent_message = replace(
+                            agent_message,
+                            data=data,
+                            resume_handle=current_runtime_handle,
                         )
 
                     yield agent_message
@@ -341,10 +471,17 @@ class ClaudeAgentAdapter:
                         error=str(e),
                         attempts=attempt,
                     )
+                    data = {
+                        "subtype": "error",
+                        "error_type": type(e).__name__,
+                    }
+                    if current_session_id:
+                        data["session_id"] = current_session_id
                     yield AgentMessage(
                         type="result",
                         content=f"Task execution failed: {e!s}",
-                        data={"subtype": "error", "error_type": type(e).__name__},
+                        data=data,
+                        resume_handle=current_runtime_handle,
                     )
                     return
 
@@ -358,7 +495,12 @@ class ClaudeAgentAdapter:
             yield AgentMessage(
                 type="result",
                 content=f"Task failed after {MAX_RETRIES} retries: {last_error!s}",
-                data={"subtype": "error", "error_type": type(last_error).__name__},
+                data={
+                    "subtype": "error",
+                    "error_type": type(last_error).__name__,
+                    **({"session_id": current_session_id} if current_session_id else {}),
+                },
+                resume_handle=current_runtime_handle,
             )
 
     def _convert_message(self, sdk_message: Any) -> AgentMessage:
@@ -550,6 +692,7 @@ class ClaudeAgentAdapter:
         prompt: str,
         tools: list[str] | None = None,
         system_prompt: str | None = None,
+        resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
     ) -> Result[TaskResult, ProviderError]:
         """Execute a task and collect all messages into a TaskResult.
@@ -562,7 +705,8 @@ class ClaudeAgentAdapter:
             prompt: The task for Claude to perform.
             tools: List of tools Claude can use. Defaults to DEFAULT_TOOLS.
             system_prompt: Optional custom system prompt.
-            resume_session_id: Session ID to resume from.
+            resume_handle: Backend-neutral handle to resume from.
+            resume_session_id: Legacy Claude session ID to resume from.
 
         Returns:
             Result containing TaskResult on success, ProviderError on failure.
@@ -571,19 +715,26 @@ class ClaudeAgentAdapter:
         final_message = ""
         success = True
         session_id: str | None = None
+        final_resume_handle = resume_handle
 
         async for message in self.execute_task(
             prompt=prompt,
             tools=tools,
             system_prompt=system_prompt,
+            resume_handle=resume_handle,
             resume_session_id=resume_session_id,
         ):
             messages.append(message)
+
+            if message.resume_handle is not None:
+                final_resume_handle = message.resume_handle
 
             if message.is_final:
                 final_message = message.content
                 success = not message.is_error
                 session_id = message.data.get("session_id")
+                if session_id and final_resume_handle is None:
+                    final_resume_handle = self._build_runtime_handle(session_id)
 
         if not success:
             return Result.err(
@@ -593,19 +744,29 @@ class ClaudeAgentAdapter:
                 )
             )
 
+        if session_id is None and final_resume_handle is not None:
+            session_id = final_resume_handle.native_session_id
+
         return Result.ok(
             TaskResult(
                 success=success,
                 final_message=final_message,
                 messages=tuple(messages),
                 session_id=session_id,
+                resume_handle=final_resume_handle,
             )
         )
 
 
+ClaudeCodeRuntime = ClaudeAgentAdapter
+
+
 __all__ = [
+    "AgentRuntime",
     "AgentMessage",
     "ClaudeAgentAdapter",
+    "ClaudeCodeRuntime",
     "DEFAULT_TOOLS",
+    "RuntimeHandle",
     "TaskResult",
 ]

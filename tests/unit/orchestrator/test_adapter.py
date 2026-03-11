@@ -11,6 +11,7 @@ from ouroboros.orchestrator.adapter import (
     DEFAULT_TOOLS,
     AgentMessage,
     ClaudeAgentAdapter,
+    RuntimeHandle,
     TaskResult,
 )
 
@@ -107,6 +108,28 @@ class TestTaskResult:
         )
         with pytest.raises(AttributeError):
             result.success = False  # type: ignore
+
+
+class TestRuntimeHandle:
+    """Tests for RuntimeHandle serialization helpers."""
+
+    def test_round_trip_dict(self) -> None:
+        """Test runtime handles can be serialized and restored."""
+        handle = RuntimeHandle(
+            backend="claude",
+            native_session_id="sess_123",
+            cwd="/tmp/project",
+            approval_mode="acceptEdits",
+            metadata={"source": "test"},
+        )
+
+        restored = RuntimeHandle.from_dict(handle.to_dict())
+
+        assert restored == handle
+
+    def test_invalid_dict_returns_none(self) -> None:
+        """Test invalid runtime handle payloads are rejected."""
+        assert RuntimeHandle.from_dict({"native_session_id": "sess_123"}) is None
 
 
 class TestClaudeAgentAdapter:
@@ -218,6 +241,7 @@ class TestClaudeAgentAdapter:
     async def test_execute_task_to_result_success(self) -> None:
         """Test execute_task_to_result with successful execution."""
         adapter = ClaudeAgentAdapter(api_key="test")
+        runtime_handle = RuntimeHandle(backend="claude", native_session_id="sess_123")
 
         # Mock the execute_task method
         async def mock_execute(*args: Any, **kwargs: Any):
@@ -226,6 +250,7 @@ class TestClaudeAgentAdapter:
                 type="result",
                 content="Task completed",
                 data={"subtype": "success", "session_id": "sess_123"},
+                resume_handle=runtime_handle,
             )
 
         with patch.object(adapter, "execute_task", mock_execute):
@@ -235,6 +260,8 @@ class TestClaudeAgentAdapter:
         assert result.value.success is True
         assert result.value.final_message == "Task completed"
         assert len(result.value.messages) == 2
+        assert result.value.session_id == "sess_123"
+        assert result.value.resume_handle == runtime_handle
 
     @pytest.mark.asyncio
     async def test_execute_task_to_result_failure(self) -> None:

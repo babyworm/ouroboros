@@ -32,7 +32,11 @@ from ouroboros.core.errors import OuroborosError
 from ouroboros.core.types import Result
 from ouroboros.observability.drift import DriftMeasurement
 from ouroboros.observability.logging import get_logger
-from ouroboros.orchestrator.adapter import DEFAULT_TOOLS, ClaudeAgentAdapter
+from ouroboros.orchestrator.adapter import (
+    DEFAULT_TOOLS,
+    AgentRuntime,
+    RuntimeHandle,
+)
 from ouroboros.orchestrator.events import (
     create_drift_measured_event,
     create_mcp_tools_loaded_event,
@@ -269,6 +273,9 @@ def build_task_prompt(
 # Progress event emission interval (every N messages)
 PROGRESS_EMIT_INTERVAL = 10
 
+# Session progress persistence interval (every N messages)
+SESSION_PROGRESS_PERSIST_INTERVAL = 10
+
 # Cancellation check interval (every N messages)
 CANCELLATION_CHECK_INTERVAL = 5
 
@@ -285,7 +292,7 @@ class OrchestratorRunner:
 
     def __init__(
         self,
-        adapter: ClaudeAgentAdapter,
+        adapter: AgentRuntime,
         event_store: EventStore,
         console: Console | None = None,
         mcp_manager: MCPClientManager | None = None,
@@ -296,7 +303,7 @@ class OrchestratorRunner:
         """Initialize orchestrator runner.
 
         Args:
-            adapter: Claude Agent adapter for task execution.
+            adapter: Agent runtime for task execution.
             event_store: Event store for persistence.
             console: Rich console for output. Uses default if not provided.
             mcp_manager: Optional MCP client manager for external tool integration.
@@ -367,6 +374,51 @@ class OrchestratorRunner:
             session_id: Session ID to remove.
         """
         self._active_sessions.pop(execution_id, None)
+
+    def _deserialize_runtime_handle(self, progress: dict[str, Any]) -> RuntimeHandle | None:
+        """Deserialize runtime resume state from session progress."""
+        runtime_handle = RuntimeHandle.from_dict(progress.get("runtime"))
+        if runtime_handle is not None:
+            return runtime_handle
+
+        legacy_session_id = progress.get("agent_session_id")
+        if isinstance(legacy_session_id, str) and legacy_session_id:
+            return RuntimeHandle(backend="claude", native_session_id=legacy_session_id)
+
+        return None
+
+    def _build_progress_update(
+        self,
+        message_type: str,
+        messages_processed: int,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> dict[str, Any]:
+        """Build a normalized progress payload for session persistence."""
+        progress: dict[str, Any] = {
+            "last_message_type": message_type,
+            "messages_processed": messages_processed,
+        }
+
+        if runtime_handle is not None:
+            progress["runtime"] = runtime_handle.to_dict()
+            if runtime_handle.backend == "claude" and runtime_handle.native_session_id:
+                progress["agent_session_id"] = runtime_handle.native_session_id
+
+        return progress
+
+    async def _persist_session_progress(
+        self,
+        session_id: str,
+        progress: dict[str, Any],
+    ) -> None:
+        """Persist session progress without interrupting execution on failure."""
+        result = await self._session_repo.track_progress(session_id, progress)
+        if result.is_err:
+            log.warning(
+                "orchestrator.runner.progress_persist_failed",
+                session_id=session_id,
+                error=str(result.error),
+            )
 
     async def cancel_execution(
         self,
@@ -831,12 +883,23 @@ class OrchestratorRunner:
                                 start_time=start_time,
                             )
 
-                    tracker = tracker.with_progress(
-                        {
-                            "last_message_type": message.type,
-                            "messages_processed": messages_processed,
-                        }
+                    previous_runtime = tracker.progress.get("runtime")
+                    progress_update = self._build_progress_update(
+                        message_type=message.type,
+                        messages_processed=messages_processed,
+                        runtime_handle=message.resume_handle,
                     )
+                    tracker = tracker.with_progress(progress_update)
+                    should_persist_progress = (
+                        message.is_final
+                        or messages_processed % SESSION_PROGRESS_PERSIST_INTERVAL == 0
+                        or progress_update.get("runtime") != previous_runtime
+                    )
+                    if should_persist_progress:
+                        await self._persist_session_progress(
+                            tracker.session_id,
+                            progress_update,
+                        )
 
                     # Update workflow state tracker
                     state_tracker.process_message(
@@ -1333,8 +1396,8 @@ class OrchestratorRunner:
 Note: This is a resumed session. Please continue from where execution was interrupted.
 """
 
-        # Get Claude Agent session ID if stored
-        agent_session_id = tracker.progress.get("agent_session_id")
+        # Get runtime resume state if stored
+        runtime_handle = self._deserialize_runtime_handle(tracker.progress)
 
         # Get merged tools (DEFAULT_TOOLS + MCP tools if configured)
         merged_tools, mcp_provider = await self._get_merged_tools(
@@ -1374,7 +1437,7 @@ Note: This is a resumed session. Please continue from where execution was interr
                     prompt=resume_prompt,
                     tools=merged_tools,
                     system_prompt=system_prompt,
-                    resume_session_id=agent_session_id,
+                    resume_handle=runtime_handle,
                 ):
                     messages_processed += 1
 
@@ -1387,6 +1450,24 @@ Note: This is a resumed session. Please continue from where execution was interr
                                 messages_processed=messages_processed,
                                 start_time=start_time,
                             )
+
+                    previous_runtime = tracker.progress.get("runtime")
+                    progress_update = self._build_progress_update(
+                        message_type=message.type,
+                        messages_processed=messages_processed,
+                        runtime_handle=message.resume_handle,
+                    )
+                    tracker = tracker.with_progress(progress_update)
+                    should_persist_progress = (
+                        message.is_final
+                        or messages_processed % SESSION_PROGRESS_PERSIST_INTERVAL == 0
+                        or progress_update.get("runtime") != previous_runtime
+                    )
+                    if should_persist_progress:
+                        await self._persist_session_progress(
+                            session_id,
+                            progress_update,
+                        )
 
                     # Update workflow state tracker
                     state_tracker.process_message(

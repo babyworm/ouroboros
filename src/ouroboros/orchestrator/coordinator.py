@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
-    from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+    from ouroboros.orchestrator.adapter import AgentRuntime
     from ouroboros.orchestrator.level_context import LevelContext
     from ouroboros.orchestrator.parallel_executor import ACExecutionResult
 
@@ -98,11 +98,11 @@ class LevelCoordinator:
     invokes Claude to resolve them.
     """
 
-    def __init__(self, adapter: ClaudeAgentAdapter) -> None:
+    def __init__(self, adapter: AgentRuntime) -> None:
         """Initialize coordinator.
 
         Args:
-            adapter: Claude Agent adapter for conflict resolution sessions.
+            adapter: Agent runtime for conflict resolution sessions.
         """
         self._adapter = adapter
 
@@ -186,7 +186,9 @@ class LevelCoordinator:
                 tools=COORDINATOR_TOOLS,
                 system_prompt=COORDINATOR_SYSTEM_PROMPT,
             ):
-                if message.data.get("session_id"):
+                if message.resume_handle is not None and message.resume_handle.native_session_id:
+                    session_id = message.resume_handle.native_session_id
+                elif message.data.get("session_id"):
                     session_id = message.data["session_id"]
                 if message.is_final:
                     final_text = message.content

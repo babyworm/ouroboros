@@ -32,7 +32,10 @@ CLI Usage:
 from ouroboros.orchestrator.adapter import (
     DEFAULT_TOOLS,
     AgentMessage,
+    AgentRuntime,
     ClaudeAgentAdapter,
+    ClaudeCodeRuntime,
+    RuntimeHandle,
     TaskResult,
 )
 from ouroboros.orchestrator.coordinator import (
@@ -104,9 +107,12 @@ from ouroboros.orchestrator.session import (
 
 __all__ = [
     # Adapter
+    "AgentRuntime",
     "AgentMessage",
     "ClaudeAgentAdapter",
+    "ClaudeCodeRuntime",
     "DEFAULT_TOOLS",
+    "RuntimeHandle",
     "TaskResult",
     # Session
     "SessionRepository",

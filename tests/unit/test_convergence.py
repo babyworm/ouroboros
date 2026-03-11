@@ -458,3 +458,80 @@ class TestEvolutionGateDetection:
         signal = criteria.evaluate(lineage)
         assert signal.converged
         assert "Max generations" in signal.reason
+
+
+class TestValidationGate:
+    """Tests for validation_gate_enabled convergence gating."""
+
+    def _converging_lineage(self) -> OntologyLineage:
+        """Create a 3-gen lineage that evolved once then converged (B→A→A)."""
+        return _lineage_with_schemas(SCHEMA_B, SCHEMA_A, SCHEMA_A)
+
+    def test_blocks_when_validation_skipped(self) -> None:
+        """Validation gate blocks convergence when validation was skipped."""
+        lineage = self._converging_lineage()
+        criteria = ConvergenceCriteria(
+            convergence_threshold=0.95,
+            min_generations=2,
+            validation_gate_enabled=True,
+        )
+        signal = criteria.evaluate(
+            lineage,
+            validation_output="Validation skipped: no project directory found",
+        )
+        assert not signal.converged
+        assert "Validation gate blocked" in signal.reason
+
+    def test_blocks_when_validation_error(self) -> None:
+        """Validation gate blocks convergence when validation had an error."""
+        lineage = self._converging_lineage()
+        criteria = ConvergenceCriteria(
+            convergence_threshold=0.95,
+            min_generations=2,
+            validation_gate_enabled=True,
+        )
+        signal = criteria.evaluate(
+            lineage,
+            validation_output="Validation error: subprocess failed",
+        )
+        assert not signal.converged
+        assert "Validation gate blocked" in signal.reason
+
+    def test_passes_when_validation_succeeded(self) -> None:
+        """Validation gate allows convergence when validation passed."""
+        lineage = self._converging_lineage()
+        criteria = ConvergenceCriteria(
+            convergence_threshold=0.95,
+            min_generations=2,
+            validation_gate_enabled=True,
+        )
+        signal = criteria.evaluate(
+            lineage,
+            validation_output="Validation passed: all checks green",
+        )
+        assert signal.converged
+
+    def test_passes_when_validation_output_none(self) -> None:
+        """Validation gate allows convergence when no validation output."""
+        lineage = self._converging_lineage()
+        criteria = ConvergenceCriteria(
+            convergence_threshold=0.95,
+            min_generations=2,
+            validation_gate_enabled=True,
+        )
+        signal = criteria.evaluate(lineage, validation_output=None)
+        assert signal.converged
+
+    def test_disabled_allows_skipped_validation(self) -> None:
+        """Disabled validation gate allows convergence even with skipped validation."""
+        lineage = self._converging_lineage()
+        criteria = ConvergenceCriteria(
+            convergence_threshold=0.95,
+            min_generations=2,
+            validation_gate_enabled=False,
+        )
+        signal = criteria.evaluate(
+            lineage,
+            validation_output="Validation skipped: no project directory",
+        )
+        assert signal.converged

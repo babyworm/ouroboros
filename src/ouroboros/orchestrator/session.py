@@ -491,8 +491,15 @@ class SessionRepository:
 
             for event in events:
                 if event.type == "orchestrator.progress.updated":
-                    messages_processed += 1
-                    last_progress = event.data.get("progress", {})
+                    progress_update = event.data.get("progress", {})
+                    if not isinstance(progress_update, dict):
+                        continue
+                    last_progress = {**last_progress, **progress_update}
+                    persisted_messages = progress_update.get("messages_processed")
+                    if isinstance(persisted_messages, int):
+                        messages_processed = persisted_messages
+                    else:
+                        messages_processed += 1
                 elif event.type == "orchestrator.session.completed":
                     tracker = tracker.with_status(SessionStatus.COMPLETED)
                 elif event.type == "orchestrator.session.failed":

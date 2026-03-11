@@ -51,12 +51,14 @@ class ConvergenceCriteria:
     ac_gate_mode: str = "all"  # "all" | "ratio" | "off"
     ac_min_pass_ratio: float = 1.0  # for "ratio" mode
     regression_gate_enabled: bool = True
+    validation_gate_enabled: bool = True
 
     def evaluate(
         self,
         lineage: OntologyLineage,
         latest_wonder: WonderOutput | None = None,
         latest_evaluation: EvaluationSummary | None = None,
+        validation_output: str | None = None,
     ) -> ConvergenceSignal:
         """Check if the loop should terminate.
 
@@ -158,6 +160,16 @@ class ConvergenceCriteria:
                     ontology_similarity=latest_sim,
                     generation=current_gen,
                 )
+
+            # Validation gate: block convergence if validation was skipped or failed
+            if self.validation_gate_enabled and validation_output:
+                if "skipped" in validation_output.lower() or "error" in validation_output.lower():
+                    return ConvergenceSignal(
+                        converged=False,
+                        reason=(f"Validation gate blocked: {validation_output}"),
+                        ontology_similarity=latest_sim,
+                        generation=current_gen,
+                    )
 
             return ConvergenceSignal(
                 converged=True,
